@@ -1,4 +1,4 @@
-# flash-attention-minimal
+# randNLA-flashattn
 A minimal re-implementation of Flash Attention with CUDA and PyTorch. 
 The official [implementation](https://github.com/Dao-AILab/flash-attention) can be quite daunting for a CUDA beginner
 (like myself), so this repo tries to be small and educational.

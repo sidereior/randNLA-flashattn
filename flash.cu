@@ -1,6 +1,11 @@
 #include <torch/types.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <shgemm/shgemm.hpp>
+#include <cutf/cuda.hpp>
+#include <cutf/cp_async.hpp>
+#include <wmma_extension/tcec/tcec.hpp>
+#include <cassert>
 
 __global__
 void forward_kernel(const float* Q, const float* K, const float* V, const int N, const int d,
@@ -39,18 +44,18 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
             float row_m_prev = m[lm_offset + (Br * i) + tx];
             float row_l_prev = l[lm_offset + (Br * i) + tx];
 
+            // Replace matrix multiplication with SHGEMM
+            mtk::shgemm::shgemmHandle_t handle;
+            mtk::shgemm::create(handle);
+            mtk::shgemm::set_cuda_stream(handle, 0);
+            mtk::shgemm::shgemm(handle, mtk::shgemm::op_n, mtk::shgemm::op_t, Bc, d, d, &softmax_scale, Qi, d, (half*)Kj, d, &c0, S, Bc, mtk::shgemm::fp16, mtk::shgemm::op_n);
+            mtk::shgemm::destroy(handle);
+
             // S = QK^T, row_m = rowmax(S)
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
-                float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
-                }
-                sum *= softmax_scale;
-                S[(Bc * tx) + y] = sum;
-
-                if (sum > row_m)
-                    row_m = sum;
+                if (S[(Bc * tx) + y] > row_m)
+                    row_m = S[(Bc * tx) + y];
             }
 
             // P = exp(S - row_m), row_l = rowsum(P)
@@ -64,15 +69,18 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
             float row_m_new = max(row_m_prev, row_m);
             float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
 
+            // Replace matrix multiplication with SHGEMM
+            mtk::shgemm::shgemmHandle_t handle;
+            mtk::shgemm::create(handle);
+            mtk::shgemm::set_cuda_stream(handle, 0);
+            mtk::shgemm::shgemm(handle, mtk::shgemm::op_n, mtk::shgemm::op_n, d, Bc, d, &c1, S, Bc, (half*)Vj, d, &c0, O + qkv_offset + (tile_size * i) + (tx * d), d, mtk::shgemm::fp16, mtk::shgemm::op_n);
+            mtk::shgemm::destroy(handle);
+
             // Write O, l, m to HBM
             for (int x = 0; x < d; x++) {
-                float pv = 0;  // Pij * Vj
-                for (int y = 0; y < Bc; y++) {
-                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
-                }
                 O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
                     * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
-                    + (__expf(row_m - row_m_new) * pv));
+                    + (__expf(row_m - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]));
             }
             m[lm_offset + (Br * i) + tx] = row_m_new;
             l[lm_offset + (Br * i) + tx] = row_l_new;
