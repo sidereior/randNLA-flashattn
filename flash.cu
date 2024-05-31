@@ -2,15 +2,11 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <shgemm/shgemm.hpp>
-#include <cutf/cuda.hpp>
-#include <cutf/cp_async.hpp>
-#include <wmma_extension/tcec/tcec.hpp>
-#include <cassert>
 
 __global__
-void forward_kernel(const float* Q, const float* K, const float* V, const int N, const int d,
+void forward_kernel(const float* Q, const float* S, const float* V, const int N, const int d,
                     const int Tc, const int Tr, const int Bc, const int Br, const float softmax_scale,
-                    float* l, float *m, float* O) {
+                    float* l, float* m, float* O) {
     int tx = threadIdx.x;
     int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
 
@@ -18,25 +14,21 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
     int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
     int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
 
-    // Define SRAM for Q,K,V,S
+    // Define SRAM for Q,V,S
     extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    int tile_size = Bc * d;  // size of Qi, Vj
     float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S = &sram[tile_size * 3];
+    float* Vj = &sram[tile_size];
+    float* local_S = &sram[tile_size * 2];
 
     for (int j = 0; j < Tc; j++) {
-
-        // Load Kj, Vj to SRAM
+        // Load Vj to SRAM
         for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
             Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
         }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        __syncthreads();  // Ensure Vj is loaded before use
 
         for (int i = 0; i < Tr; i++)  {
-
             // Load Qi to SRAM, l and m to registers
             for (int x = 0; x < d; x++) {
                 Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
@@ -44,58 +36,51 @@ void forward_kernel(const float* Q, const float* K, const float* V, const int N,
             float row_m_prev = m[lm_offset + (Br * i) + tx];
             float row_l_prev = l[lm_offset + (Br * i) + tx];
 
-            // Replace matrix multiplication with SHGEMM
-            mtk::shgemm::shgemmHandle_t handle;
-            mtk::shgemm::create(handle);
-            mtk::shgemm::set_cuda_stream(handle, 0);
-            mtk::shgemm::shgemm(handle, mtk::shgemm::op_n, mtk::shgemm::op_t, Bc, d, d, &softmax_scale, Qi, d, (half*)Kj, d, &c0, S, Bc, mtk::shgemm::fp16, mtk::shgemm::op_n);
-            mtk::shgemm::destroy(handle);
+            // Load S to local SRAM
+            for (int x = 0; x < Bc; x++) {
+                local_S[(Bc * tx) + x] = S[(qkv_offset / d) + (tile_size * i) + (tx * d) + x];
+            }
+            __syncthreads();  // Ensure S is loaded before use
 
-            // S = QK^T, row_m = rowmax(S)
+            // Find row_m (max value in S)
             float row_m = -INFINITY;
             for (int y = 0; y < Bc; y++) {
-                if (S[(Bc * tx) + y] > row_m)
-                    row_m = S[(Bc * tx) + y];
+                if (local_S[(Bc * tx) + y] > row_m)
+                    row_m = local_S[(Bc * tx) + y];
             }
 
             // P = exp(S - row_m), row_l = rowsum(P)
             float row_l = 0;
             for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-                row_l += S[(Bc * tx) + y];
+                local_S[(Bc * tx) + y] = __expf(local_S[(Bc * tx) + y] - row_m);
+                row_l += local_S[(Bc * tx) + y];
             }
 
             // Compute new m and l
             float row_m_new = max(row_m_prev, row_m);
             float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
 
-            // Replace matrix multiplication with SHGEMM
-            mtk::shgemm::shgemmHandle_t handle;
-            mtk::shgemm::create(handle);
-            mtk::shgemm::set_cuda_stream(handle, 0);
-            mtk::shgemm::shgemm(handle, mtk::shgemm::op_n, mtk::shgemm::op_n, d, Bc, d, &c1, S, Bc, (half*)Vj, d, &c0, O + qkv_offset + (tile_size * i) + (tx * d), d, mtk::shgemm::fp16, mtk::shgemm::op_n);
-            mtk::shgemm::destroy(handle);
-
-            // Write O, l, m to HBM
+            // Compute O
             for (int x = 0; x < d; x++) {
+                float pv = 0;  // Pij * Vj
+                for (int y = 0; y < Bc; y++) {
+                    pv += local_S[(Bc * tx) + y] * Vj[(y * d) + x];
+                }
                 O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
                     * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
-                    + (__expf(row_m - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]));
+                    + (__expf(row_m - row_m_new) * pv));
             }
             m[lm_offset + (Br * i) + tx] = row_m_new;
             l[lm_offset + (Br * i) + tx] = row_l_new;
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+        __syncthreads();  // Ensure all threads have updated m and l before next iteration
     }
 }
 
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    // TODO: determine Bc, Br dynamically
     const int Bc = 32; const int Br = 32;
-
     const int B = Q.size(0); const int nh = Q.size(1);
     const int N = Q.size(2); const int d = Q.size(3);
-
     const int Tc = ceil((float) N / Bc); const int Tr = ceil((float) N / Br);
     const float softmax_scale = 1.0 / sqrt(d);
 
@@ -106,19 +91,52 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
     torch::Device device(torch::kCUDA);
     l = l.to(device); m = m.to(device);
 
+    // Create SHGEMM handle
+    mtk::shgemm::shgemmHandle_t shgemm_handle;
+    mtk::shgemm::create(shgemm_handle);
+
+    // Allocate space for S on device
+    auto S = torch::empty({B, nh, N, Bc}, torch::dtype(torch::kFloat).device(device));
+
+    // Perform SHGEMM for QK^T
+    for (int b = 0; b < B; b++) {
+        for (int h = 0; h < nh; h++) {
+            float* Q_ptr = Q[b][h].data_ptr<float>();
+            float* K_ptr = K[b][h].data_ptr<float>();
+            float* S_ptr = S[b][h].data_ptr<float>();
+            const float alpha = softmax_scale;
+            const float beta = 0.0f;
+            mtk::shgemm::shgemm(
+                shgemm_handle,
+                mtk::shgemm::op_n, mtk::shgemm::op_t,
+                N, Bc, d,
+                &alpha,
+                Q_ptr, d,
+                reinterpret_cast<const half*>(K_ptr), d,
+                &beta,
+                S_ptr, N,
+                mtk::shgemm::fp16
+            );
+        }
+    }
+
     // Calculate SRAM size needed per block
     const int sram_size = (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
     int max_sram_size;
     cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-    printf("Max shared memory: %d, requested shared memory: %d \\n", max_sram_size, sram_size);
+    printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
 
     dim3 grid_dim(B, nh);  // batch_size x num_heads
     dim3 block_dim(Bc);  // Bc threads per block
 
     forward_kernel<<<grid_dim, block_dim, sram_size>>>(
-        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+        Q.data_ptr<float>(), S.data_ptr<float>(), V.data_ptr<float>(),
         N, d, Tc, Tr, Bc, Br, softmax_scale,
         l.data_ptr<float>(), m.data_ptr<float>(), O.data_ptr<float>()
     );
+
+    // Destroy SHGEMM handle
+    mtk::shgemm::destroy(shgemm_handle);
+
     return O;
 }

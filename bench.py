@@ -1,11 +1,25 @@
 import math
-
 import torch
 from torch.nn import functional as F
 from torch.utils.cpp_extension import load
+import os
+
+# Set the TORCH_CUDA_ARCH_LIST environment variable if necessary
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'  # Adjust according to your GPU architecture
+
+# Get the absolute path to the shgemm library
+shgemm_lib_path = os.path.abspath('shgemm/build/libshgemm.a')
 
 # Load the CUDA kernel as a python module
-minimal_attn = load(name='minimal_attn', sources=['main.cpp', 'flash.cu'], extra_cuda_cflags=['-O2'])
+minimal_attn = load(
+    name='minimal_attn',
+    sources=['main.cpp', 'flash.cu'],
+    extra_include_paths=['shgemm/include'],  # Path to the shgemm headers
+    extra_cflags=['-O2'],
+    extra_cuda_cflags=['-O2'],
+    extra_ldflags=[shgemm_lib_path, '-lcublas', '-lcudart'],  # Link against the static library
+    verbose=True  # Enable verbose output to help debug issues
+)
 
 # Use small model params, otherwise slower than manual attention. See caveats in README.
 batch_size = 16
